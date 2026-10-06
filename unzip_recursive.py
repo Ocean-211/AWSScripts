@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 
 from pathlib import Path
+from typing import List
 from zipfile import ZipFile, BadZipFile
 
 
-def safe_extract(zip_file: Path, destination: Path) -> list"""
-    Safely extract a ZIP archive and return the extracted file paths.
-    Prevents ZIP path-traversal attacks.
+def safe_extract(zip_file: Path, destination: Path) -> List[Path]:
+    """
+    Safely extract a ZIP archive and return all extracted file paths.
     """
     destination = destination.resolve()
-    extracted_files = []
+    extracted_files: List[Path] = []
 
     with ZipFile(zip_file, "r") as archive:
-        for member in archive.infolist():
+        members = archive.infolist()
+
+        # Validate paths before extracting anything
+        for member in members:
             target = (destination / member.filename).resolve()
 
-            # Prevent entries such as ../../malicious_file
             if target != destination and destination not in target.parents:
                 raise ValueError(
                     f"Unsafe path in {zip_file}: {member.filename}"
@@ -23,13 +26,12 @@ def safe_extract(zip_file: Path, destination: Path) -> list"""
 
         archive.extractall(destination)
 
-        # Record files only, excluding directory entries
-        for member in archive.infolist():
+        # Record extracted files, excluding directories
+        for member in members:
             if not member.is_dir():
-                extracted_file = (
-                    destination / member.filename
-                ).resolve()
-                extracted_files.append(extracted_file)
+                extracted_files.append(
+                    (destination / member.filename).resolve()
+                )
 
     return extracted_files
 
@@ -38,15 +40,14 @@ def main() -> None:
     root_directory = Path(".").resolve()
     output_file = root_directory / "unzipped_paths.txt"
 
-    # Create the list before extraction so newly extracted nested ZIPs
-    # are not unintentionally processed during this run.
-    zip_files = [
+    # Identify ZIP files recursively
+    zip_files = sorted(
         path
         for path in root_directory.rglob("*")
         if path.is_file() and path.suffix.lower() == ".zip"
-    ]
+    )
 
-    report_lines = []
+    report_lines: List[str] = []
     successful_archives = 0
     total_extracted_files = 0
 
@@ -59,8 +60,8 @@ def main() -> None:
 
         try:
             extracted_files = safe_extract(
-                zip_file=zip_file,
-                destination=destination,
+                zip_file,
+                destination,
             )
 
             successful_archives += 1
@@ -77,13 +78,17 @@ def main() -> None:
             report_lines.append("")
 
         except BadZipFile:
-            print(f"Skipped invalid ZIP file: {zip_file}")
-            report_lines.append(f"INVALID_ZIP: {zip_file.resolve()}")
+            print(f"Skipped invalid ZIP: {zip_file}")
+            report_lines.append(
+                f"INVALID_ZIP: {zip_file.resolve()}"
+            )
             report_lines.append("")
 
         except (OSError, ValueError) as error:
             print(f"Failed to extract {zip_file}: {error}")
-            report_lines.append(f"FAILED_ZIP: {zip_file.resolve()}")
+            .append(
+                f"FAILED_ZIP: {zip_file.resolve()}"
+            )
             report_lines.append(f"ERROR: {error}")
             report_lines.append("")
 
@@ -94,7 +99,10 @@ def main() -> None:
 
     print()
     print(f"ZIP files identified: {len(zip_files)}")
-    print(f"ZIP files successfully extracted: {successful_archives}")
+    print(
+        f"ZIP files successfully extracted: "
+        f"{successful_archives}"
+    )
     print(f"Files extracted: {total_extracted_files}")
     print(f"Report written to: {output_file}")
 
