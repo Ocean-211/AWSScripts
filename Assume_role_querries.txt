@@ -117,3 +117,281 @@ jq -r '
   | @tsv
 ' "$REPORT" |
 column -t -s $'\t'
+
+9. Identify attached and orphaned instance profiles
+
+Profiles attached to EC2
+
+jq -r '
+  .profiles[]
+  | .profile as $profile
+  | .instance_profiles[]?
+  | select(
+      ((.ec2_associations // []) | length) > 0
+    )
+  | [
+      $profile,
+      .instance_profile_name,
+      .instance_profile_arn,
+      (
+        .ec2_associations
+        | map(.region + ":" + .instance_id)
+        | join(",")
+      )
+    ]
+  | @tsv
+' "$REPORT" |
+column -t -s $'\t'
+
+Profiles with no discovered EC2 association
+
+jq -r '
+  .profiles[]
+  | .profile as $profile
+  | .instance_profiles[]?
+  | select(
+      ((.ec2_associations // []) | length) == 0
+    )
+  | [
+      $profile,
+      .instance_profile_name,
+      .instance_profile_arn,
+      ((.roles // []) | map(.role_name) | join(","))
+    ]
+  | @tsv
+' "$REPORT" |
+column -t -s $'\t'
+
+---------------------------------------------------------------------------------
+8. Correlate trust exposure with role impact
+
+The most important roles are those with both:
+
+A potentially broad assumption path
+High-impact permissions
+
+jq '
+  .profiles[]
+  | .profile as $profile
+  | .source_identity.account as $account
+  | .instance_profiles[]?
+  | .instance_profile_name as $instanceProfile
+  | .roles[]?
+  | . as $role
+  | [
+      .findings[]?
+      | select(
+          .category == "TrustPolicy"
+          or .category == "OIDCTrust"
+          or .category == "FederatedTrust"
+          or .category == "SAMLTrust"
+          or .category == "ServiceTrust"
+          or .category == "TrustCondition"
+        )
+      | select(
+          .severity == "HIGH"
+          or .severity == "CRITICAL"
+        )
+    ] as $trustFindings
+  | [
+      .findings[]?
+      | select(
+          .category == "PrivilegeEscalationPermission"
+          or .category == "HighImpactPermission"
+        )
+      | select(
+          .severity == "HIGH"
+          or .severity == "CRITICAL"
+        )
+    ] as $impactFindings
+  | select(
+      ($trustFindings | length) > 0
+      and ($impactFindings | length) > 0
+    )
+  | {
+      aws_profile: $profile,
+      account: $account,
+      instance_profile: $instanceProfile,
+      role_name: $role.role_name,
+      role_arn: $role.role_arn,
+      ec2_associations: $role.ec2_associations,
+      trust_findings: $trustFindings,
+      permission_findings: $impactFindings
+    }
+' "$REPORT" > "$EVIDENCE_DIR/high_priority_roles.json"
+
+---------------------------------------------------------------------------------------------------
+7. Analyze role permissions and impact
+Trust exposure answers who might obtain the role. Permission analysis answers what the role can do afterward.
+
+High and critical findings
+
+jq -r '
+  .profiles[]
+  | .profile as $profile
+  | .source_identity.account as $account
+  | .instance_profiles[]?
+  | .instance_profile_name as $instanceProfile
+  | .roles[]?
+  | .role_arn as $role
+  | .findings[]?
+  | select(
+      .severity == "HIGH"
+      or .severity == "CRITICAL"
+    )
+  | [
+      $profile,
+      $account,
+      $instanceProfile,
+      $role,
+      .severity,
+      .category,
+      .title,
+      (.evidence | tojson)
+    ]
+  | @tsv
+' "$REPORT" |
+column -t -s $'\t'
+
+....................................................
+Privilege-escalation-relevant permissions
+
+jq '
+  .profiles[]
+  | .profile as $profile
+  | .instance_profiles[]?
+  | .instance_profile_name as $instanceProfile
+  | .roles[]?
+  | .role_arn as $role
+  | [
+      .findings[]?
+      | select(
+          .category == "PrivilegeEscalationPermission"
+        )
+    ] as $privesc
+  | select(($privesc | length) > 0)
+  | {
+      aws_profile: $profile,
+      instance_profile: $instanceProfile,
+      role_arn: $role,
+      privilege_escalation_findings: $privesc
+    }
+' "$REPORT"
+
+......................................................
+Administrative or high-impact permissions
+jq '
+  .profiles[]
+  | .profile as $profile
+  | .instance_profiles[]?
+  | .roles[]?
+  | .role_arn as $role
+  | [
+      .findings[]?
+      | select(
+          .category == "HighImpactPermission"
+        )
+    ] as $impact
+  | select(($impact | length) > 0)
+  | {
+      aws_profile: $profile,
+      role_arn: $role,
+      high_impact_findings: $impact
+    }
+' "$REPORT"
+
+.........................................................
+------------------------------------------------------------------------------
+10. Analyze OIDC and GitHub trust
+
+jq '
+  .profiles[]
+  | .profile as $profile
+  | .instance_profiles[]?
+  | .instance_profile_name as $instanceProfile
+  | .roles[]?
+  | select(
+      any(
+        .trust_policy.Statement[]?;
+        .Principal.Federated != null
+      )
+    )
+  | {
+      aws_profile: $profile,
+      instance_profile: $instanceProfile,
+      role_name,
+      role_arn,
+      federated_statements: [
+        .trust_policy.Statement[]
+        | select(.Principal.Federated != null)
+      ]
+    }
+' "$REPORT"
+
+***********************************************
+For each GH role, inspect:
+
+token.actions.githubusercontent.com:aud
+token.actions.githubusercontent.com:sub
+
+Prioritize:
+
+Missing aud
+Missing sub
+sub containing *
+Organization-wide repository wildcard
+Any-repository wildcard
+Any-branch wildcard
+Environment trust without expected environment restrictions
+***********************************************
+---------------------------------------------------------------------------------------
+
+5. Identify cross-account trusts
+jq '
+  .profiles[]
+  | .profile as $profile
+  | .source_identity.account as $targetAccount
+  | .instance_profiles[]?
+  | .instance_profile_name as $instanceProfile
+  | .roles[]?
+  | .role_arn as $role
+  | .trust_policy.Statement[]?
+  | select(
+      .Effect == "Allow"
+      and .Principal.AWS != null
+    )
+  | (.Principal.AWS | if type == "array" then .[] else . end) as $principal
+  | select(
+      ($principal | type) == "string"
+      and ($principal | test("^arn:aws:iam::[0-9]{12}:"))
+    )
+  | ($principal | capture("^arn:aws:iam::(?<account>[0-9]{12}):").account) as $trustedAccount
+  | select($trustedAccount != $targetAccount)
+  | {
+      aws_profile: $profile,
+      target_account: $targetAccount,
+      instance_profile: $instanceProfile,
+      role_arn: $role,
+      trusted_principal: $principal,
+      trusted_account: $trustedAccount,
+      condition: (.Condition // {}),
+      external_id_present: (
+        ((.Condition // {}) | tostring)
+        | contains("sts:ExternalId")
+      )
+    }
+' "$REPORT"
+
+***************************************************************
+Prioritize:
+
+External account trust with no ExternalId
+External account root trust
+External IAM user trust
+External IAM role trust using broad conditions
+Trust to an account that is no longer an approved vendor or integration
+
+Remember that missing ExternalId is particularly relevant for third-party delegated access, but not every legitimate cross-account trust requires it.
+*******************************************************************
+---------------------------------------------------------------------------------------------------------------------------
+
