@@ -1,0 +1,119 @@
+1. List AWS accounts and Profiles Status
+
+jq -r '
+  .profiles[]
+  | [
+      .profile,
+      (.source_identity.account // "UNKNOWN"),
+      .status
+    ]
+  | @tsv
+' "$REPORT" |
+column -t -s $'\t'
+
+3. List all instance profiles and contained role ARNs
+
+jq -r '
+  .profiles[]
+  | .profile as $profile
+  | .source_identity.account as $account
+  | .instance_profiles[]?
+  | .instance_profile_name as $instance_profile
+  | .roles[]?
+  | select(.role_arn != null)
+  | [
+      $profile,
+      $account,
+      $instance_profile,
+      .role_name,
+      .role_arn
+    ]
+  | @tsv
+' "$REPORT" |
+column -t -s $'\t'
+
+4. List potential trust matches
+This is the most relevant query for identifying possible --probe-role-arn candidates:
+
+jq -r '
+  .profiles[]
+  | .profile as $profile
+  | .source_identity.account as $account
+  | .source_identity.arn as $source
+  | .instance_profiles[]?
+  | .instance_profile_name as $instance_profile
+  | .roles[]?
+  | select(
+      .source_profile_is_potential_trust_match == true
+    )
+  | [
+      $profile,
+      $account,
+      $source,
+      $instance_profile,
+      .role_name,
+      .role_arn
+    ]
+  | @tsv
+' "$REPORT" |
+column -t -s $'\t'
+
+output provides the follwoing:
+
+AWS CLI profile
+AWS account ID for --allowed-account
+Source identity ARN
+Instance-profile name
+Role name
+Role ARN for --probe-role-arn
+
+
+5. Save candidate roles to a file
+
+jq -r '
+  .profiles[]
+  | .profile as $profile
+  | .source_identity.account as $account
+  | .source_identity.arn as $source
+  | .instance_profiles[]?
+  | .instance_profile_name as $instance_profile
+  | .roles[]?
+  | select(
+      .source_profile_is_potential_trust_match == true
+    )
+  | [
+      $profile,
+      $account,
+      $source,
+      $instance_profile,
+      .role_name,
+      .role_arn
+    ]
+  | @tsv
+' "$REPORT" > potential_trust_matches.tsv
+
+6. Show high and critical findings
+
+jq -r '
+  .profiles[]
+  | .profile as $profile
+  | .instance_profiles[]?
+  | .instance_profile_name as $instance_profile
+  | .roles[]?
+  | .role_arn as $role
+  | .findings[]?
+  | select(
+      .severity == "HIGH"
+      or .severity == "CRITICAL"
+    )
+  | [
+      $profile,
+      $instance_profile,
+      $role,
+      .severity,
+      .category,
+      .title
+    ]
+  | @tsv
+' "$REPORT" |
+column -t -s $'\t'
